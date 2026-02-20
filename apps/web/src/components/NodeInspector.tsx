@@ -10,18 +10,18 @@ export function NodeInspector() {
   const node = useMemo(() => current?.workflow.nodes.find((n) => n.id === selectedNodeId), [current, selectedNodeId]);
 
   if (!node) {
-    return <Card className="h-full text-sm text-slate-500">Select a node to edit its config.</Card>;
+    return <Card className="glass-panel h-full text-sm text-slate-300">Select a node to edit its config.</Card>;
   }
 
   return (
-    <Card className="h-full space-y-3">
+    <Card className="glass-panel h-full space-y-3">
       <div>
-        <div className="text-xs uppercase text-slate-500">Node</div>
-        <h3 className="font-semibold">{node.name}</h3>
-        <p className="text-xs text-slate-500">{node.type}</p>
+        <div className="text-xs uppercase text-slate-400">Node</div>
+        <h3 className="font-semibold text-slate-100">{node.name}</h3>
+        <p className="text-xs text-slate-400">{node.type}</p>
       </div>
       <div>
-        <label className="mb-1 block text-xs uppercase text-slate-500">Config (JSON)</label>
+        <label className="mb-1 block text-xs uppercase text-slate-400">Config (JSON)</label>
         <Textarea
           rows={16}
           defaultValue={JSON.stringify(node.config, null, 2)}

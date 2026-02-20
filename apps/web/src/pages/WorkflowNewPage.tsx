@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -6,7 +6,10 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { WorkflowCanvas } from "@/components/WorkflowCanvas";
 import { NodeInspector } from "@/components/NodeInspector";
+import { SemanticEditorRail } from "@/components/SemanticEditorRail";
+import { SUPABASE_ANON_KEY, SUPABASE_URL } from "@/lib/env";
 import { supabase } from "@/lib/supabase";
+import { trackEvent } from "@/lib/analytics";
 import { validateWorkflowDoc } from "@/lib/workflow";
 import { simulateWorkflow } from "@/lib/simulate";
 import { useWorkflowStore } from "@/stores/workflowStore";
@@ -24,9 +27,19 @@ export function WorkflowNewPage() {
   const [tags, setTags] = useState("va");
   const [errors, setErrors] = useState<string[]>([]);
   const [status, setStatus] = useState<string | null>(null);
+  const [showJson, setShowJson] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
 
-  const { current, setWorkflow, selectedNodeId, setSelectedNodeId } = useWorkflowStore();
+  const { current, setWorkflow, selectedNodeId, setSelectedNodeId, patchNode } = useWorkflowStore();
   const nav = useNavigate();
+
+  useEffect(() => {
+    const draft = localStorage.getItem("vyntra_draft_prompt");
+    if (draft) {
+      setPrompt(draft);
+      localStorage.removeItem("vyntra_draft_prompt");
+    }
+  }, []);
 
   async function readFunctionError(error: unknown): Promise<string[]> {
     const fallback = error instanceof Error ? error.message : "Failed to generate workflow.";
@@ -56,43 +69,63 @@ export function WorkflowNewPage() {
   async function generate() {
     setStatus("Generating workflow...");
     setErrors([]);
+    setIsGenerating(true);
+    void trackEvent("generate_clicked", { source: "workflow_new", prompt_length: prompt.length });
 
-    const { data: userData, error: userError } = await supabase.auth.getUser();
-    if (userError || !userData.user) {
-      setStatus(null);
-      setErrors(["You must be signed in to generate workflows."]);
-      return;
-    }
-
-    const { data, error } = await supabase.functions.invoke("generate-workflow", {
-      body: { prompt, name, description, tags: tags.split(",").map((t) => t.trim()).filter(Boolean) },
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/generate-workflow`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      },
+      body: JSON.stringify({ prompt, name, description, tags: tags.split(",").map((t) => t.trim()).filter(Boolean) }),
     });
 
-    if (error) {
+    const data = await res.json().catch(() => null);
+    const rawText = data ? "" : await res.text().catch(() => "");
+    if (!res.ok || !data) {
       setStatus(null);
-      setErrors(await readFunctionError(error));
+      setIsGenerating(false);
+      if (Array.isArray(data?.details)) {
+        setErrors(data.details.map((d: { path?: string[]; message?: string }) => `${(d.path ?? []).join(".")}: ${d.message ?? "Validation error"}`));
+      } else {
+        setErrors([data?.error ?? rawText ?? `Function failed (${res.status})`]);
+      }
+      void trackEvent("generate_failed", { source: "workflow_new", http_status: res.status, has_details: Array.isArray(data?.details) });
       return;
     }
 
     if (!data?.ok) {
       setStatus(null);
+      setIsGenerating(false);
       if (Array.isArray(data?.details)) {
         setErrors(data.details.map((d: { path?: string[]; message?: string }) => `${(d.path ?? []).join(".")}: ${d.message ?? "Validation error"}`));
       } else {
         setErrors([data?.error ?? "Failed to generate workflow."]);
       }
+      void trackEvent("generate_failed", { source: "workflow_new", http_status: res.status, has_details: Array.isArray(data?.details) });
       return;
     }
 
     const parsed = validateWorkflowDoc(data?.workflow_doc);
     if (!parsed.ok) {
       setStatus(null);
+      setIsGenerating(false);
       setErrors(parsed.errors);
+      void trackEvent("generate_failed", { source: "workflow_new", validation_errors: parsed.errors.length });
       return;
     }
 
     setWorkflow(parsed.data);
     setStatus("Workflow generated.");
+    setIsGenerating(false);
+    void trackEvent("generate_success", {
+      source: "workflow_new",
+      workflow_id: parsed.data.workflow.id,
+      node_count: parsed.data.workflow.nodes.length,
+      edge_count: parsed.data.workflow.edges.length,
+    });
   }
 
   async function save() {
@@ -122,6 +155,12 @@ export function WorkflowNewPage() {
       .single();
 
     if (error) return setErrors([error.message]);
+    void trackEvent("workflow_saved", {
+      source: "workflow_new",
+      workflow_id: data.id,
+      node_count: check.data.workflow.nodes.length,
+      edge_count: check.data.workflow.edges.length,
+    });
     nav(`/app/workflows/${data.id}`);
   }
 
@@ -132,12 +171,43 @@ export function WorkflowNewPage() {
 
     const result = simulateWorkflow(check.data);
     setStatus(`Simulation completed (unsaved workflow): ${result.status}`);
+    void trackEvent("simulation_run", {
+      source: "workflow_new",
+      status: result.status,
+      step_count: result.steps.length,
+      node_count: check.data.workflow.nodes.length,
+      saved: false,
+    });
+  }
+
+  async function copyJson() {
+    if (!current) return;
+    await navigator.clipboard.writeText(JSON.stringify(current, null, 2));
+    setStatus("Workflow JSON copied.");
+  }
+
+  function downloadJson() {
+    if (!current) return;
+    const blob = new Blob([JSON.stringify(current, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${current.workflow.id || "workflow"}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function onMoveNode(nodeId: string, position: { x: number; y: number }) {
+    if (!current) return;
+    const node = current.workflow.nodes.find((n) => n.id === nodeId);
+    if (!node) return;
+    patchNode({ ...node, position });
   }
 
   return (
     <div className="space-y-4">
       <h1 className="text-2xl font-semibold">New Workflow</h1>
-      <div className="grid gap-4 xl:grid-cols-[320px_1fr_320px]">
+      <div className="grid gap-4 xl:grid-cols-[320px_1fr_380px]">
         <Card className="space-y-3">
           <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Workflow name" />
           <Input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Description" />
@@ -154,21 +224,58 @@ export function WorkflowNewPage() {
             <Button onClick={generate}>Generate</Button>
             <Button variant="outline" onClick={simulate} disabled={!current}>Test Workflow</Button>
             <Button variant="outline" onClick={save} disabled={!current}>Save</Button>
+            <Button variant="outline" onClick={() => setShowJson((v) => !v)} disabled={!current}>
+              {showJson ? "Hide JSON" : "View JSON"}
+            </Button>
+            <Button variant="outline" onClick={copyJson} disabled={!current}>Copy JSON</Button>
+            <Button variant="outline" onClick={downloadJson} disabled={!current}>Download JSON</Button>
           </div>
           {status && <p className="text-sm text-slate-600">{status}</p>}
           {errors.length > 0 && <pre className="overflow-auto text-xs text-red-700">{errors.join("\n")}</pre>}
+          {showJson && current && (
+            <pre className="max-h-80 overflow-auto rounded bg-slate-50 p-2 text-xs">{JSON.stringify(current, null, 2)}</pre>
+          )}
         </Card>
 
         <div>
-          {current ? (
-            <WorkflowCanvas doc={current} onSelectNode={setSelectedNodeId} />
+          {isGenerating ? (
+            <Card className="h-[600px] flex-col items-center justify-center gap-5 text-center">
+              <div className="grid grid-cols-3 gap-3">
+                <div className="neural-pulse h-5 w-5 rounded-full bg-cyan-300" />
+                <div className="neural-pulse h-5 w-5 rounded-full bg-violet-400 [animation-delay:120ms]" />
+                <div className="neural-pulse h-5 w-5 rounded-full bg-cyan-300 [animation-delay:240ms]" />
+              </div>
+              <div>
+                <p className="font-semibold text-slate-100">Synthesizing your workflow map</p>
+                <p className="text-xs text-slate-400">Mapping nodes, routing logic, and output actions...</p>
+              </div>
+            </Card>
+          ) : current ? (
+            <WorkflowCanvas doc={current} onSelectNode={setSelectedNodeId} onMoveNode={onMoveNode} />
           ) : (
-            <Card className="h-[600px] text-sm text-slate-500">Generate a workflow or start from template.</Card>
+            <Card className="h-[600px]">
+              <p className="text-xs uppercase tracking-[0.15em] text-slate-400">15-sec Guided Tour</p>
+              <div className="mt-4 grid gap-4">
+                <div className="rounded border border-white/10 bg-white/5 p-3 text-sm text-slate-200">1. Describe your process on the left panel.</div>
+                <div className="rounded border border-cyan-400/40 bg-cyan-400/10 p-3 text-sm text-cyan-100">2. AI drafts nodes and connects the flow.</div>
+                <div className="rounded border border-white/10 bg-white/5 p-3 text-sm text-slate-200">3. Review config in inspector and run test.</div>
+              </div>
+              <div className="mt-8 rounded-xl border border-white/10 bg-[#1A1F2B]/70 p-4">
+                <p className="mb-2 text-xs text-slate-400">Ghost Canvas Preview</p>
+                <div className="grid grid-cols-4 gap-3 opacity-50">
+                  <div className="rounded bg-white/10 p-2 text-xs">Trigger</div>
+                  <div className="rounded bg-white/10 p-2 text-xs">AI Extract</div>
+                  <div className="rounded bg-white/10 p-2 text-xs">Condition</div>
+                  <div className="rounded bg-white/10 p-2 text-xs">Output</div>
+                </div>
+              </div>
+            </Card>
           )}
         </div>
 
-        <div>
+        <div className="grid h-[600px] gap-4 grid-rows-[1fr_1fr]">
           <NodeInspector key={selectedNodeId ?? "none"} />
+          <SemanticEditorRail />
         </div>
       </div>
     </div>

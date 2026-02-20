@@ -14,10 +14,10 @@ export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
       <Comp
         ref={ref}
         className={cn(
-          "inline-flex items-center justify-center rounded-md px-3 py-2 text-sm font-medium transition",
-          variant === "default" && "bg-blue-600 text-white hover:bg-blue-700",
-          variant === "outline" && "border border-slate-300 bg-white hover:bg-slate-50",
-          variant === "ghost" && "hover:bg-slate-100",
+          "inline-flex items-center justify-center rounded-md px-3 py-2 text-sm font-medium transition duration-200",
+          variant === "default" && "bg-violet-600 text-white shadow-[0_0_20px_rgba(124,58,237,0.45)] hover:bg-violet-500",
+          variant === "outline" && "border border-white/20 bg-white/5 text-slate-100 hover:bg-white/10",
+          variant === "ghost" && "text-slate-200 hover:bg-white/10",
           className,
         )}
         {...props}

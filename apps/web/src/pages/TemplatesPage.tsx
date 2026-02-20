@@ -4,6 +4,7 @@ import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { supabase } from "@/lib/supabase";
+import { trackEvent } from "@/lib/analytics";
 import type { TemplateRow } from "@/types/app";
 
 export function TemplatesPage() {
@@ -41,6 +42,12 @@ export function TemplatesPage() {
       .single();
 
     if (error) return setError(error.message);
+    void trackEvent("template_used", {
+      template_id: t.id,
+      template_name: t.name,
+      category: t.category,
+      created_workflow_id: data.id,
+    });
     nav(`/app/workflows/${data.id}`);
   }
 

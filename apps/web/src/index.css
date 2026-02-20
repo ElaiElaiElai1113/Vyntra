@@ -1,19 +1,46 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap");
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
-  --background: 0 0% 100%;
-  --foreground: 224 71% 4%;
-  --primary: 217 91% 60%;
-  --primary-foreground: 210 40% 98%;
-  --secondary: 214 32% 91%;
-  --secondary-foreground: 222 47% 11%;
-  --border: 214 32% 91%;
-  --input: 214 32% 91%;
-  --ring: 217 91% 60%;
+  --background: 224 29% 6%;
+  --foreground: 220 20% 98%;
+  --primary: 263 83% 58%;
+  --primary-foreground: 220 20% 98%;
+  --secondary: 223 27% 16%;
+  --secondary-foreground: 220 20% 98%;
+  --border: 225 23% 18%;
+  --input: 225 23% 18%;
+  --ring: 188 100% 49%;
 }
 
 body {
-  @apply bg-white text-slate-900 antialiased;
+  background: radial-gradient(circle at 20% 20%, rgba(124, 58, 237, 0.22), transparent 32%),
+    radial-gradient(circle at 80% 10%, rgba(0, 245, 255, 0.12), transparent 30%),
+    #0b0e14;
+  color: #f9fafb;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  @apply antialiased;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: "Inter", system-ui, sans-serif;
+  letter-spacing: -0.02em;
+}
+
+.glass-panel {
+  background: linear-gradient(180deg, rgba(26, 31, 43, 0.72), rgba(26, 31, 43, 0.5));
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(249, 250, 251, 0.1);
+}
+
+.neural-pulse {
+  animation: pulse-node 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse-node {
+  0%, 100% { transform: scale(0.95); opacity: 0.6; }
+  50% { transform: scale(1.08); opacity: 1; }
 }
