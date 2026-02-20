@@ -5,3 +5,4 @@ node_modules
 apps/web/dist
 .supabase
 coverage
+*.tsbuildinfo
