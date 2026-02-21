@@ -146,6 +146,150 @@ function cleanJson(input: string): string {
   return input.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function toPort(port: unknown, fallbackId: string) {
+  if (isRecord(port)) {
+    return {
+      id: typeof port.id === "string" && port.id ? port.id : fallbackId,
+      label: typeof port.label === "string" && port.label ? port.label : fallbackId,
+      schema: typeof port.schema === "string" && port.schema ? port.schema : "JSON",
+    };
+  }
+  if (typeof port === "string" && port.trim()) {
+    return {
+      id: port.trim(),
+      label: port.trim(),
+      schema: "JSON",
+    };
+  }
+  return {
+    id: fallbackId,
+    label: fallbackId,
+    schema: "JSON",
+  };
+}
+
+function toEndpoint(endpoint: unknown, fallbackNode = "", fallbackPort = "") {
+  if (isRecord(endpoint)) {
+    return {
+      node_id: typeof endpoint.node_id === "string" ? endpoint.node_id : fallbackNode,
+      port_id: typeof endpoint.port_id === "string" ? endpoint.port_id : fallbackPort,
+    };
+  }
+
+  if (typeof endpoint === "string" && endpoint.trim()) {
+    const raw = endpoint.trim();
+    const byDot = raw.split(".");
+    if (byDot.length === 2) return { node_id: byDot[0], port_id: byDot[1] };
+    const byColon = raw.split(":");
+    if (byColon.length === 2) return { node_id: byColon[0], port_id: byColon[1] };
+    const bySlash = raw.split("/");
+    if (bySlash.length === 2) return { node_id: bySlash[0], port_id: bySlash[1] };
+  }
+
+  return { node_id: fallbackNode, port_id: fallbackPort };
+}
+
+function normalizeNodeType(type: unknown): string {
+  if (typeof type !== "string") return "";
+  const normalized = type.trim().toLowerCase();
+  const aliases: Record<string, string> = {
+    "output.email": "output.export",
+    "output.email_send": "output.export",
+    "output.send_email": "output.export",
+    "output.export_email": "output.export",
+  };
+  return aliases[normalized] ?? normalized;
+}
+
+function normalizeWorkflowDoc(parsed: unknown): unknown {
+  if (!isRecord(parsed)) return parsed;
+  const doc = { ...parsed };
+
+  if (doc.schema_version !== "1.0") {
+    doc.schema_version = "1.0";
+  }
+
+  if (!isRecord(doc.workflow)) return doc;
+  const workflow = { ...doc.workflow };
+
+  if (!Array.isArray(workflow.nodes)) workflow.nodes = [];
+  if (!Array.isArray(workflow.edges)) workflow.edges = [];
+
+  workflow.nodes = workflow.nodes.map((node, idx) => {
+    const rawNode = isRecord(node) ? { ...node } : {};
+    const rawType = normalizeNodeType(rawNode.type);
+    const isTrigger = triggerNodeTypes.includes(rawType as (typeof triggerNodeTypes)[number]);
+
+    const config = isRecord(rawNode.config) ? { ...rawNode.config } : {};
+    if (rawType === "output.export") {
+      const rawFormat = typeof config.format === "string" ? config.format.toLowerCase().trim() : "";
+      if (rawFormat === "email" || rawFormat === "mail") {
+        config.delivery_intent = "email";
+        config.format = "json";
+      } else if (rawFormat === "csv") {
+        config.format = "csv";
+      } else {
+        config.format = "json";
+      }
+      if (typeof config.filename !== "string" || !config.filename.trim()) {
+        config.filename = config.format === "csv" ? "export.csv" : "export.json";
+      }
+      if (typeof config.input_path !== "string" || !config.input_path.trim()) {
+        config.input_path = "$";
+      }
+    }
+
+    return {
+      id: typeof rawNode.id === "string" && rawNode.id ? rawNode.id : `n${idx + 1}`,
+      type: rawType,
+      name: typeof rawNode.name === "string" && rawNode.name ? rawNode.name : `Node ${idx + 1}`,
+      position: isRecord(rawNode.position) &&
+          typeof rawNode.position.x === "number" &&
+          typeof rawNode.position.y === "number"
+        ? rawNode.position
+        : { x: 80 + idx * 220, y: 120 },
+      inputs: isTrigger
+        ? []
+        : Array.isArray(rawNode.inputs) && rawNode.inputs.length
+        ? rawNode.inputs.map((p, pIdx) => toPort(p, pIdx === 0 ? "in" : `in${pIdx + 1}`))
+        : [toPort("in", "in")],
+      outputs: Array.isArray(rawNode.outputs) && rawNode.outputs.length
+        ? rawNode.outputs.map((p, pIdx) => toPort(p, pIdx === 0 ? "out" : `out${pIdx + 1}`))
+        : [toPort("out", "out")],
+      config,
+      ui: isRecord(rawNode.ui) && typeof rawNode.ui.icon === "string" && typeof rawNode.ui.color === "string"
+        ? rawNode.ui
+        : { icon: "node", color: "neutral" },
+    };
+  });
+
+  workflow.edges = workflow.edges.map((edge, idx) => {
+    const rawEdge = isRecord(edge) ? { ...edge } : {};
+    const source = toEndpoint(rawEdge.source);
+    const target = toEndpoint(rawEdge.target);
+    return {
+      id: typeof rawEdge.id === "string" && rawEdge.id ? rawEdge.id : `e${idx + 1}`,
+      source: {
+        node_id: source.node_id,
+        port_id: source.port_id || "out",
+      },
+      target: {
+        node_id: target.node_id,
+        port_id: target.port_id || "in",
+      },
+      label: typeof rawEdge.label === "string" ? rawEdge.label : null,
+      condition: typeof rawEdge.condition === "string" ? rawEdge.condition : null,
+    };
+  });
+
+  doc.workflow = workflow;
+  return doc;
+}
+
 function buildSystemPrompt(args: { name?: string; description?: string; tags?: string[]; retryErrors?: string[] }) {
   const base = `You generate workflow documents for Vyntra.
 Return ONLY one valid JSON object. No markdown. No prose. No code fences.
@@ -206,6 +350,8 @@ Rules:
 - all node ids and edge ids must be unique
 - edge source must reference an OUTPUT port
 - edge target must reference an INPUT port
+- for output.export, format must be "json" or "csv" only
+- if user intent mentions sending email, still use output.export with format "json" and include config.delivery_intent="email"
 
 Use practical config values for VA workflows.`;
 
@@ -259,7 +405,8 @@ async function callOpenAI(prompt: string, systemPrompt: string) {
 function parseAndValidate(content: string) {
   const cleaned = cleanJson(content);
   const parsed = JSON.parse(cleaned);
-  return workflowDocSchema.safeParse(parsed);
+  const normalized = normalizeWorkflowDoc(parsed);
+  return workflowDocSchema.safeParse(normalized);
 }
 
 Deno.serve(async (req) => {

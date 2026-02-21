@@ -6,6 +6,7 @@ export type AnalyticsEventName =
   | "generate_failed"
   | "workflow_saved"
   | "simulation_run"
+  | "live_run"
   | "template_used";
 
 export async function trackEvent(eventName: AnalyticsEventName, properties: Record<string, unknown> = {}) {

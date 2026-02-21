@@ -1,0 +1,390 @@
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+type ReqBody = {
+  workflow_id: string;
+  input_json?: Record<string, unknown>;
+};
+
+type StepResult = {
+  node_id: string;
+  node_name: string;
+  node_type: string;
+  status: "success" | "failed";
+  started_at: string;
+  finished_at: string;
+  duration_ms: number;
+  selected_output_port: string | null;
+  next_node_ids: string[];
+  input: unknown;
+  output: unknown;
+  error?: string;
+};
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+};
+
+function clone<T>(v: T): T {
+  return JSON.parse(JSON.stringify(v));
+}
+
+function tokenizeJsonPath(path: string): string[] {
+  const normalized = path.replace(/^\$\./, "").replace(/^\$/, "");
+  const tokens: string[] = [];
+  const pattern = /([^[.\]]+)|\[(\d+|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')\]/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(normalized))) {
+    if (match[1]) tokens.push(match[1]);
+    else if (match[2]) {
+      const raw = match[2];
+      tokens.push(/^\d+$/.test(raw) ? raw : raw.slice(1, -1));
+    }
+  }
+  return tokens;
+}
+
+function resolveJsonPath(input: unknown, path?: string): unknown {
+  if (!path || path === "$") return input;
+  if (!path.startsWith("$")) return undefined;
+  const tokens = tokenizeJsonPath(path);
+  let current: unknown = input;
+  for (const token of tokens) {
+    if (Array.isArray(current) && /^\d+$/.test(token)) {
+      current = current[Number(token)];
+      continue;
+    }
+    if (current && typeof current === "object" && token in (current as Record<string, unknown>)) {
+      current = (current as Record<string, unknown>)[token];
+      continue;
+    }
+    return undefined;
+  }
+  return current;
+}
+
+function parseLiteral(raw: string): unknown {
+  const value = raw.trim();
+  if ((value.startsWith("'") && value.endsWith("'")) || (value.startsWith("\"") && value.endsWith("\""))) return value.slice(1, -1);
+  if (value === "true") return true;
+  if (value === "false") return false;
+  if (value === "null") return null;
+  const num = Number(value);
+  if (!Number.isNaN(num)) return num;
+  return value;
+}
+
+function resolveOperand(ctx: Record<string, unknown>, raw: string): unknown {
+  const value = raw.trim();
+  if (value.startsWith("$")) return resolveJsonPath(ctx, value);
+  return parseLiteral(value);
+}
+
+function evaluateConditionExpression(ctx: Record<string, unknown>, expression: string): boolean {
+  const match = expression.match(/^\s*(.+?)\s*(==|!=|>=|<=|>|<)\s*(.+)\s*$/);
+  if (!match) return false;
+  const [, leftRaw, op, rightRaw] = match;
+  const left = resolveOperand(ctx, leftRaw);
+  const right = resolveOperand(ctx, rightRaw);
+  switch (op) {
+    case "==": return left === right;
+    case "!=": return left !== right;
+    case ">": return Number(left) > Number(right);
+    case "<": return Number(left) < Number(right);
+    case ">=": return Number(left) >= Number(right);
+    case "<=": return Number(left) <= Number(right);
+    default: return false;
+  }
+}
+
+function classifyText(input: unknown, labels: string[]): { label: string; confidence: number } {
+  const text = String(typeof input === "string" ? input : JSON.stringify(input)).toLowerCase();
+  const scored = labels.map((label) => ({ label, score: text.includes(label.toLowerCase()) ? 2 : 1 }));
+  scored.sort((a, b) => b.score - a.score || a.label.localeCompare(b.label));
+  return { label: scored[0]?.label ?? "general", confidence: scored[0]?.score === 2 ? 0.92 : 0.67 };
+}
+
+function toCsv(data: unknown): string {
+  if (!Array.isArray(data)) return JSON.stringify(data, null, 2);
+  const rows = data as Array<Record<string, unknown>>;
+  if (!rows.length) return "";
+  const headers = Object.keys(rows[0]);
+  const lines = [headers.join(",")];
+  for (const row of rows) {
+    const values = headers.map((h) => {
+      const value = row[h];
+      const raw = typeof value === "string" ? value : JSON.stringify(value ?? "");
+      return `"${raw.replace(/"/g, '""')}"`;
+    });
+    lines.push(values.join(","));
+  }
+  return lines.join("\n");
+}
+
+function topo(doc: any) {
+  const nodesById = new Map((doc.workflow.nodes ?? []).map((n: any) => [n.id, n]));
+  const indeg = new Map((doc.workflow.nodes ?? []).map((n: any) => [n.id, 0]));
+  const adj = new Map<string, string[]>();
+  for (const e of doc.workflow.edges ?? []) {
+    indeg.set(e.target.node_id, (indeg.get(e.target.node_id) ?? 0) + 1);
+    adj.set(e.source.node_id, [...(adj.get(e.source.node_id) ?? []), e.target.node_id]);
+  }
+  const q: string[] = [...indeg.entries()].filter(([, v]) => v === 0).map(([k]) => k);
+  const ordered: any[] = [];
+  while (q.length) {
+    const id = q.shift()!;
+    const node = nodesById.get(id);
+    if (node) ordered.push(node);
+    for (const nxt of adj.get(id) ?? []) {
+      indeg.set(nxt, (indeg.get(nxt) ?? 0) - 1);
+      if ((indeg.get(nxt) ?? 0) === 0) q.push(nxt);
+    }
+  }
+  return ordered;
+}
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
+  if (req.method !== "POST") return new Response(JSON.stringify({ ok: false, error: "Method not allowed" }), { status: 405, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+
+  try {
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const supabaseAnon = Deno.env.get("SUPABASE_ANON_KEY");
+    if (!supabaseUrl || !supabaseAnon) {
+      return new Response(JSON.stringify({ ok: false, error: "Supabase env missing" }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+
+    const authHeader = req.headers.get("Authorization") ?? "";
+    const client = createClient(supabaseUrl, supabaseAnon, {
+      global: { headers: { Authorization: authHeader } },
+    });
+
+    const { data: userRes, error: userErr } = await client.auth.getUser();
+    const user = userRes?.user;
+    if (userErr || !user) {
+      return new Response(JSON.stringify({ ok: false, error: "Unauthorized" }), { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+
+    const body = (await req.json()) as ReqBody;
+    if (!body.workflow_id) {
+      return new Response(JSON.stringify({ ok: false, error: "workflow_id is required" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+
+    const { data: wf, error: wfErr } = await client
+      .from("workflows")
+      .select("id,user_id,definition_json")
+      .eq("id", body.workflow_id)
+      .single();
+
+    if (wfErr || !wf) {
+      return new Response(JSON.stringify({ ok: false, error: "Workflow not found" }), { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+
+    const doc = wf.definition_json as any;
+    if (!doc?.workflow?.nodes || !doc?.workflow?.edges) {
+      return new Response(JSON.stringify({ ok: false, error: "Invalid workflow definition" }), { status: 422, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+
+    const ordered = topo(doc);
+    if (ordered.length !== doc.workflow.nodes.length) {
+      return new Response(JSON.stringify({ ok: false, error: "Workflow graph is not a DAG" }), { status: 422, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+
+    const trigger = doc.workflow.nodes.find((n: any) => n.id === doc.workflow.entry_node_id);
+    const triggerCfg = (trigger?.config ?? {}) as Record<string, unknown>;
+    const initialInput = body.input_json ?? (triggerCfg.sample_input ?? triggerCfg.sample_payload ?? triggerCfg.payload ?? {});
+
+    const outgoingByNodeId = new Map<string, any[]>();
+    for (const edge of doc.workflow.edges) {
+      outgoingByNodeId.set(edge.source.node_id, [...(outgoingByNodeId.get(edge.source.node_id) ?? []), edge]);
+    }
+
+    let ctx: Record<string, unknown> = { input: clone(initialInput) };
+    const activeNodeIds = new Set<string>([doc.workflow.entry_node_id]);
+    const steps: StepResult[] = [];
+
+    for (const node of ordered) {
+      if (!activeNodeIds.has(node.id)) continue;
+      const started = Date.now();
+      const startedAt = new Date(started).toISOString();
+      const inSnapshot = clone(ctx);
+
+      try {
+        const out = { ...ctx } as Record<string, unknown>;
+        const config = (node.config ?? {}) as Record<string, unknown>;
+
+        if (node.type === "ai.summarize") {
+          const input = resolveJsonPath(out, (config.input_path as string | undefined) ?? "$.input");
+          out[(config.output_key as string | undefined) ?? "summary"] = `Summary: ${String(typeof input === "string" ? input : JSON.stringify(input)).slice(0, 180)}`;
+        }
+        if (node.type === "ai.classify") {
+          const input = resolveJsonPath(out, (config.input_path as string | undefined) ?? "$.input");
+          const labels = Array.isArray(config.labels) ? config.labels.filter((x): x is string => typeof x === "string") : [];
+          const result = classifyText(input, labels);
+          out[(config.output_key as string | undefined) ?? "label"] = result.label;
+          out[(config.confidence_key as string | undefined) ?? "confidence"] = result.confidence;
+        }
+        if (node.type === "ai.extract_fields") {
+          const fields = Array.isArray(config.fields) ? config.fields : [];
+          const extracted = Object.fromEntries(fields.map((f: any) => [f?.key ?? "field", f?.type === "number" ? 0 : f?.type === "boolean" ? false : f?.type === "array" ? [] : ""]));
+          out[(config.output_key as string | undefined) ?? "extracted"] = extracted;
+        }
+        if (node.type === "ai.generate_report") {
+          const input = resolveJsonPath(out, (config.input_path as string | undefined) ?? "$.input");
+          out[(config.output_key as string | undefined) ?? "report"] = `# Generated Report\n\n- Source: ${JSON.stringify(input).slice(0, 120)}\n- Step 1\n- Step 2`;
+        }
+        if (node.type === "logic.delay") out.delay_applied = config.seconds ?? 0;
+
+        if (node.type === "output.db_save") {
+          const mapping = (config.mapping ?? {}) as Record<string, unknown>;
+          const payload = Object.fromEntries(
+            Object.entries(mapping).map(([key, value]) => {
+              if (typeof value === "string" && value.startsWith("$")) return [key, resolveJsonPath(out, value)];
+              return [key, value];
+            }),
+          );
+
+          const { data: saved, error: saveErr } = await client
+            .from("va_items")
+            .insert({
+              user_id: user.id,
+              workflow_id: wf.id,
+              source_node_id: node.id,
+              data_json: payload,
+            })
+            .select("id")
+            .single();
+          if (saveErr) throw new Error(`db_save failed: ${saveErr.message}`);
+
+          out.db_save = {
+            would_save: true,
+            table: (config.table as string | undefined) ?? "va_items",
+            mode: (config.mode as string | undefined) ?? "insert",
+            payload,
+            inserted_id: saved?.id,
+          };
+        }
+
+        if (node.type === "output.export") {
+          const data = resolveJsonPath(out, (config.input_path as string | undefined) ?? "$.input");
+          const format = (config.format as string | undefined) ?? "json";
+          const filename = (config.filename as string | undefined) ?? `export.${format}`;
+          const content = format === "csv" ? toCsv(data) : JSON.stringify(data, null, 2);
+
+          const { data: exp, error: expErr } = await client
+            .from("workflow_exports")
+            .insert({
+              user_id: user.id,
+              workflow_id: wf.id,
+              source_node_id: node.id,
+              format,
+              filename,
+              content_text: content,
+              payload_json: data as any,
+            })
+            .select("id")
+            .single();
+          if (expErr) throw new Error(`export failed: ${expErr.message}`);
+
+          out.export = { format, filename, content, export_id: exp?.id };
+        }
+
+        let selectedPort: string | null = null;
+        if (node.type === "logic.condition") {
+          const expression = String(config.expression ?? "");
+          const defaultOutput = typeof config.default_output === "string" ? config.default_output : null;
+          const outputIds: string[] = (node.outputs ?? []).map((o: any) => o.id);
+          const nonDefault = outputIds.find((id: string) => id !== defaultOutput) ?? outputIds[0] ?? null;
+          selectedPort = evaluateConditionExpression(out, expression) ? nonDefault : defaultOutput ?? nonDefault;
+        }
+
+        const outgoing = outgoingByNodeId.get(node.id) ?? [];
+        const followed = node.type === "logic.condition" && selectedPort
+          ? outgoing.filter((e) => e.source.port_id === selectedPort)
+          : outgoing;
+        const nextIds = followed.map((e) => e.target.node_id);
+        for (const nid of nextIds) activeNodeIds.add(nid);
+
+        const finished = Date.now();
+        steps.push({
+          node_id: node.id,
+          node_name: node.name,
+          node_type: node.type,
+          status: "success",
+          started_at: startedAt,
+          finished_at: new Date(finished).toISOString(),
+          duration_ms: finished - started,
+          selected_output_port: selectedPort,
+          next_node_ids: nextIds,
+          input: inSnapshot,
+          output: clone(out),
+        });
+
+        ctx = out;
+      } catch (err) {
+        const finished = Date.now();
+        steps.push({
+          node_id: node.id,
+          node_name: node.name,
+          node_type: node.type,
+          status: "failed",
+          started_at: startedAt,
+          finished_at: new Date(finished).toISOString(),
+          duration_ms: finished - started,
+          selected_output_port: null,
+          next_node_ids: [],
+          input: inSnapshot,
+          output: { error: err instanceof Error ? err.message : "Unknown error" },
+          error: err instanceof Error ? err.message : "Unknown error",
+        });
+
+        const { data: failedRun } = await client
+          .from("runs")
+          .insert({
+            user_id: user.id,
+            workflow_id: wf.id,
+            status: "failed",
+            input_json: { source: "run-live", payload: initialInput },
+            output_json: ctx,
+            steps,
+          })
+          .select("id")
+          .single();
+
+        return new Response(JSON.stringify({ ok: false, error: "Run failed", run_id: failedRun?.id, details: err instanceof Error ? err.message : "Unknown error" }), {
+          status: 500,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    const { data: run, error: runErr } = await client
+      .from("runs")
+      .insert({
+        user_id: user.id,
+        workflow_id: wf.id,
+        status: "success",
+        input_json: { source: "run-live", payload: initialInput },
+        output_json: ctx,
+        steps,
+      })
+      .select("id")
+      .single();
+
+    if (runErr) {
+      return new Response(JSON.stringify({ ok: false, error: runErr.message }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    return new Response(JSON.stringify({ ok: true, run_id: run?.id, output_json: ctx, steps_count: steps.length }), {
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : "Unexpected error" }), {
+      status: 500,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+});

@@ -5,6 +5,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { supabase } from "@/lib/supabase";
 import { trackEvent } from "@/lib/analytics";
+import { validateWorkflowDoc } from "@/lib/workflow";
+import { simulateWorkflow } from "@/lib/simulate";
 import type { TemplateRow } from "@/types/app";
 
 export function TemplatesPage() {
@@ -51,6 +53,52 @@ export function TemplatesPage() {
     nav(`/app/workflows/${data.id}`);
   }
 
+  async function runTemplateDemo(t: TemplateRow) {
+    setError(null);
+    const { data: userRes } = await supabase.auth.getUser();
+    const userId = userRes.user?.id;
+    if (!userId) return setError("Please sign in first.");
+
+    const parsed = validateWorkflowDoc(t.definition_json);
+    if (!parsed.ok) return setError(parsed.errors.join("\n"));
+
+    const { data, error } = await supabase
+      .from("workflows")
+      .insert({
+        user_id: userId,
+        name: `${t.name} (Demo)`,
+        description: t.description,
+        prompt: "Created from template demo run",
+        tags: t.tags,
+        definition_json: parsed.data,
+      })
+      .select("id")
+      .single();
+
+    if (error) return setError(error.message);
+
+    const result = simulateWorkflow(parsed.data);
+    const { error: runErr } = await supabase.from("runs").insert({
+      user_id: userId,
+      workflow_id: data.id,
+      status: result.status,
+      input_json: { source: "template-demo", template_id: t.id },
+      output_json: result.output,
+      steps: result.steps,
+    });
+    if (runErr) return setError(runErr.message);
+
+    void trackEvent("template_used", {
+      template_id: t.id,
+      template_name: t.name,
+      category: t.category,
+      created_workflow_id: data.id,
+      demo_run: true,
+    });
+
+    nav("/app/runs");
+  }
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
@@ -69,7 +117,10 @@ export function TemplatesPage() {
                 <p className="text-sm text-slate-600">{tpl.description}</p>
                 <p className="text-xs text-slate-500">{tpl.category}</p>
               </div>
-              <Button onClick={() => useTemplate(tpl)}>Use Template</Button>
+              <div className="flex gap-2">
+                <Button onClick={() => useTemplate(tpl)}>Use Template</Button>
+                <Button variant="outline" onClick={() => runTemplateDemo(tpl)}>Run Demo</Button>
+              </div>
             </div>
             <div className="flex gap-1">
               {tpl.tags.map((tag) => (
