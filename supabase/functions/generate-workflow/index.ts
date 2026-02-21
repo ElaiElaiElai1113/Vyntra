@@ -1,4 +1,5 @@
 import { z } from "npm:zod@3.24.1";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const allowedNodeTypes = [
   "trigger.manual",
@@ -141,6 +142,9 @@ const corsHeaders = {
 const OPENAI_BASE_URL = Deno.env.get("OPENAI_BASE_URL") ?? "https://api.openai.com/v1";
 const OPENAI_MODEL = Deno.env.get("OPENAI_MODEL") ?? "gpt-4.1-mini";
 const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
+const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY");
+const GENERATE_WORKFLOW_MONTHLY_LIMIT = Number(Deno.env.get("GENERATE_WORKFLOW_MONTHLY_LIMIT") ?? "250");
 
 function cleanJson(input: string): string {
   return input.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
@@ -409,6 +413,10 @@ function parseAndValidate(content: string) {
   return workflowDocSchema.safeParse(normalized);
 }
 
+function monthStartIso(d = new Date()): string {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1, 0, 0, 0, 0)).toISOString();
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
@@ -422,10 +430,76 @@ Deno.serve(async (req) => {
       });
     }
 
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+      return new Response(JSON.stringify({ ok: false, error: "Supabase env missing" }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    const authHeader = req.headers.get("Authorization") ?? "";
+    const client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+      global: { headers: { Authorization: authHeader } },
+    });
+    const { data: userRes, error: userErr } = await client.auth.getUser();
+    if (userErr || !userRes.user) {
+      return new Response(JSON.stringify({ ok: false, error: "Unauthorized" }), {
+        status: 401,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
     const body = (await req.json()) as GenerateRequest;
     if (!body?.prompt || typeof body.prompt !== "string") {
       return new Response(JSON.stringify({ ok: false, error: "Invalid request body: prompt is required" }), {
         status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+    if (!Number.isFinite(GENERATE_WORKFLOW_MONTHLY_LIMIT) || GENERATE_WORKFLOW_MONTHLY_LIMIT < 1) {
+      return new Response(JSON.stringify({ ok: false, error: "Invalid GENERATE_WORKFLOW_MONTHLY_LIMIT configuration" }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    const userId = userRes.user.id;
+    const periodStart = monthStartIso();
+    const { count, error: quotaErr } = await client
+      .from("ai_generation_events")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .eq("event_name", "generate_workflow")
+      .gte("created_at", periodStart);
+
+    if (quotaErr) {
+      return new Response(JSON.stringify({ ok: false, error: `Quota check failed: ${quotaErr.message}` }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+    if ((count ?? 0) >= GENERATE_WORKFLOW_MONTHLY_LIMIT) {
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: "Monthly generation limit reached",
+          limit: GENERATE_WORKFLOW_MONTHLY_LIMIT,
+          period_start: periodStart,
+        }),
+        {
+          status: 429,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        },
+      );
+    }
+
+    const { error: usageErr } = await client.from("ai_generation_events").insert({
+      user_id: userId,
+      event_name: "generate_workflow",
+    });
+    if (usageErr) {
+      return new Response(JSON.stringify({ ok: false, error: `Usage write failed: ${usageErr.message}` }), {
+        status: 500,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }

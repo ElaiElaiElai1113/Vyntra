@@ -1,4 +1,4 @@
-import { workflowDocSchema, type WorkflowDoc } from "@shared/schema/workflow";
+import { workflowDocSchema, type WorkflowDoc } from "../../../../shared/schema/workflow.ts";
 
 export function validateWorkflowDoc(input: unknown): { ok: true; data: WorkflowDoc } | { ok: false; errors: string[] } {
   const result = workflowDocSchema.safeParse(input);

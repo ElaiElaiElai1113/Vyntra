@@ -72,12 +72,21 @@ export function WorkflowNewPage() {
     setIsGenerating(true);
     void trackEvent("generate_clicked", { source: "workflow_new", prompt_length: prompt.length });
 
+    const { data: sessionRes, error: sessionErr } = await supabase.auth.getSession();
+    const accessToken = sessionRes.session?.access_token;
+    if (sessionErr || !accessToken) {
+      setStatus(null);
+      setIsGenerating(false);
+      setErrors(["You are not authenticated. Please sign in again and retry."]);
+      return;
+    }
+
     const res = await fetch(`${SUPABASE_URL}/functions/v1/generate-workflow`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         apikey: SUPABASE_ANON_KEY,
-        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        Authorization: `Bearer ${accessToken}`,
       },
       body: JSON.stringify({ prompt, name, description, tags: tags.split(",").map((t) => t.trim()).filter(Boolean) }),
     });

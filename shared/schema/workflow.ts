@@ -95,6 +95,13 @@ export const workflowDocSchema = z
         message: "entry_node_id must point to the trigger node.",
       });
     }
+    if (!nodes.some((n) => n.id === doc.workflow.entry_node_id)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["workflow", "entry_node_id"],
+        message: "entry_node_id must reference an existing node.",
+      });
+    }
 
     const nodeIds = new Set<string>();
     for (const n of nodes) {
@@ -142,6 +149,17 @@ export const workflowDocSchema = z
           });
         }
       }
+
+      if (n.type === "output.export") {
+        const format = n.config.format;
+        if (format !== "json" && format !== "csv") {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["workflow", "nodes"],
+            message: `Export node ${n.id} format must be "json" or "csv".`,
+          });
+        }
+      }
     }
 
     const edgeIds = new Set<string>();
@@ -185,6 +203,30 @@ export const workflowDocSchema = z
           message: `Edge ${e.id} target port must reference an input port.`,
         });
       }
+    }
+
+    const indeg = new Map(nodes.map((n) => [n.id, 0]));
+    const adj = new Map<string, string[]>();
+    for (const e of edges) {
+      indeg.set(e.target.node_id, (indeg.get(e.target.node_id) ?? 0) + 1);
+      adj.set(e.source.node_id, [...(adj.get(e.source.node_id) ?? []), e.target.node_id]);
+    }
+    const q = [...indeg.entries()].filter(([, v]) => v === 0).map(([id]) => id);
+    let visited = 0;
+    while (q.length) {
+      const id = q.shift()!;
+      visited += 1;
+      for (const nxt of adj.get(id) ?? []) {
+        indeg.set(nxt, (indeg.get(nxt) ?? 0) - 1);
+        if ((indeg.get(nxt) ?? 0) === 0) q.push(nxt);
+      }
+    }
+    if (visited !== nodes.length) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["workflow", "edges"],
+        message: "Workflow graph must be a DAG (no cycles).",
+      });
     }
   });
 

@@ -267,7 +267,8 @@ Deno.serve(async (req) => {
 
         if (node.type === "output.export") {
           const data = resolveJsonPath(out, (config.input_path as string | undefined) ?? "$.input");
-          const format = (config.format as string | undefined) ?? "json";
+          const rawFormat = typeof config.format === "string" ? config.format.toLowerCase().trim() : "json";
+          const format = rawFormat === "csv" ? "csv" : "json";
           const filename = (config.filename as string | undefined) ?? `export.${format}`;
           const content = format === "csv" ? toCsv(data) : JSON.stringify(data, null, 2);
 

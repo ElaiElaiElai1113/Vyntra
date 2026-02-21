@@ -1,15 +1,16 @@
-import { useEffect, useState } from "react";
+import { Suspense, lazy, useEffect, useState } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 import type { Session } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabase";
-import { AppShell } from "@/components/AppShell";
-import { LandingPage } from "@/pages/LandingPage";
-import { AuthPage } from "@/pages/AuthPage";
-import { DashboardPage } from "@/pages/DashboardPage";
-import { WorkflowNewPage } from "@/pages/WorkflowNewPage";
-import { WorkflowDetailPage } from "@/pages/WorkflowDetailPage";
-import { TemplatesPage } from "@/pages/TemplatesPage";
-import { RunsPage } from "@/pages/RunsPage";
+
+const AppShell = lazy(() => import("@/components/AppShell").then((m) => ({ default: m.AppShell })));
+const LandingPage = lazy(() => import("@/pages/LandingPage").then((m) => ({ default: m.LandingPage })));
+const AuthPage = lazy(() => import("@/pages/AuthPage").then((m) => ({ default: m.AuthPage })));
+const DashboardPage = lazy(() => import("@/pages/DashboardPage").then((m) => ({ default: m.DashboardPage })));
+const WorkflowNewPage = lazy(() => import("@/pages/WorkflowNewPage").then((m) => ({ default: m.WorkflowNewPage })));
+const WorkflowDetailPage = lazy(() => import("@/pages/WorkflowDetailPage").then((m) => ({ default: m.WorkflowDetailPage })));
+const TemplatesPage = lazy(() => import("@/pages/TemplatesPage").then((m) => ({ default: m.TemplatesPage })));
+const RunsPage = lazy(() => import("@/pages/RunsPage").then((m) => ({ default: m.RunsPage })));
 
 function Protected({ session, children }: { session: Session | null; children: JSX.Element }) {
   if (!session) return <Navigate to="/auth" replace />;
@@ -36,24 +37,26 @@ export default function App() {
   if (loading) return <div className="p-8 text-sm text-slate-600">Loading...</div>;
 
   return (
-    <Routes>
-      <Route path="/" element={<LandingPage />} />
-      <Route path="/auth" element={<AuthPage session={session} />} />
+    <Suspense fallback={<div className="p-8 text-sm text-slate-600">Loading...</div>}>
+      <Routes>
+        <Route path="/" element={<LandingPage />} />
+        <Route path="/auth" element={<AuthPage session={session} />} />
 
-      <Route
-        path="/app"
-        element={
-          <Protected session={session}>
-            <AppShell />
-          </Protected>
-        }
-      >
-        <Route index element={<DashboardPage />} />
-        <Route path="workflows/new" element={<WorkflowNewPage />} />
-        <Route path="workflows/:id" element={<WorkflowDetailPage />} />
-        <Route path="templates" element={<TemplatesPage />} />
-        <Route path="runs" element={<RunsPage />} />
-      </Route>
-    </Routes>
+        <Route
+          path="/app"
+          element={
+            <Protected session={session}>
+              <AppShell />
+            </Protected>
+          }
+        >
+          <Route index element={<DashboardPage />} />
+          <Route path="workflows/new" element={<WorkflowNewPage />} />
+          <Route path="workflows/:id" element={<WorkflowDetailPage />} />
+          <Route path="templates" element={<TemplatesPage />} />
+          <Route path="runs" element={<RunsPage />} />
+        </Route>
+      </Routes>
+    </Suspense>
   );
 }

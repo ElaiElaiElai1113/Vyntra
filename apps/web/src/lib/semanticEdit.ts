@@ -1,5 +1,5 @@
-import type { WorkflowDoc, WorkflowNode, WorkflowEdge } from "@shared/schema/workflow";
-import { validateWorkflowDoc } from "@/lib/workflow";
+import type { WorkflowDoc, WorkflowNode, WorkflowEdge } from "../../../../shared/schema/workflow.ts";
+import { validateWorkflowDoc } from "./workflow.ts";
 
 type EditResult = {
   ok: boolean;
