@@ -25,8 +25,18 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
+const RUN_MODE = (Deno.env.get("RUN_MODE") ?? "simulate").toLowerCase();
+const OPENAI_BASE_URL = Deno.env.get("OPENAI_BASE_URL") ?? "https://api.openai.com/v1";
+const OPENAI_MODEL = Deno.env.get("OPENAI_MODEL") ?? "gpt-4.1-mini";
+const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
+const RUN_WORKFLOW_MONTHLY_LIMIT = Number(Deno.env.get("RUN_WORKFLOW_MONTHLY_LIMIT") ?? "500");
+
 function clone<T>(v: T): T {
   return JSON.parse(JSON.stringify(v));
+}
+
+function monthStartIso(d = new Date()): string {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1, 0, 0, 0, 0)).toISOString();
 }
 
 function tokenizeJsonPath(path: string): string[] {
@@ -104,6 +114,62 @@ function classifyText(input: unknown, labels: string[]): { label: string; confid
   return { label: scored[0]?.label ?? "general", confidence: scored[0]?.score === 2 ? 0.92 : 0.67 };
 }
 
+async function callOpenAIText(args: { prompt: string; system?: string }): Promise<string> {
+  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not configured");
+
+  const res = await fetch(`${OPENAI_BASE_URL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      temperature: 0.2,
+      messages: [
+        {
+          role: "system",
+          content: args.system ?? "You are a concise workflow execution assistant.",
+        },
+        {
+          role: "user",
+          content: args.prompt,
+        },
+      ],
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`OpenAI error (${res.status}): ${text}`);
+  }
+
+  const json = await res.json();
+  const content = json?.choices?.[0]?.message?.content;
+  if (!content || typeof content !== "string") {
+    throw new Error("OpenAI response missing message content");
+  }
+
+  return content.trim();
+}
+
+async function summarizeTextLive(input: unknown, config: Record<string, unknown>): Promise<string> {
+  const source = typeof input === "string" ? input : JSON.stringify(input);
+  const style = typeof config.style === "string" ? config.style : "concise";
+  const bullets = Boolean(config.bullets);
+  const instructions = typeof config.instructions === "string" ? config.instructions : "Summarize the input.";
+
+  const bulletHint = bullets ? "Use bullets." : "Return a short paragraph.";
+  const prompt = [
+    `Task: ${instructions}`,
+    `Style: ${style}. ${bulletHint}`,
+    "Input:",
+    source,
+  ].join("\n\n");
+
+  return callOpenAIText({ prompt });
+}
+
 function toCsv(data: unknown): string {
   if (!Array.isArray(data)) return JSON.stringify(data, null, 2);
   const rows = data as Array<Record<string, unknown>>;
@@ -164,6 +230,36 @@ Deno.serve(async (req) => {
     if (userErr || !user) {
       return new Response(JSON.stringify({ ok: false, error: "Unauthorized" }), { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
+    if (!Number.isFinite(RUN_WORKFLOW_MONTHLY_LIMIT) || RUN_WORKFLOW_MONTHLY_LIMIT < 1) {
+      return new Response(JSON.stringify({ ok: false, error: "Invalid RUN_WORKFLOW_MONTHLY_LIMIT configuration" }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    const periodStart = monthStartIso();
+    const { count: runsCount, error: quotaErr } = await client
+      .from("runs")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", user.id)
+      .gte("created_at", periodStart);
+    if (quotaErr) {
+      return new Response(JSON.stringify({ ok: false, error: `Run quota check failed: ${quotaErr.message}` }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+    if ((runsCount ?? 0) >= RUN_WORKFLOW_MONTHLY_LIMIT) {
+      return new Response(JSON.stringify({
+        ok: false,
+        error: "Monthly run limit reached",
+        limit: RUN_WORKFLOW_MONTHLY_LIMIT,
+        period_start: periodStart,
+      }), {
+        status: 429,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
 
     const body = (await req.json()) as ReqBody;
     if (!body.workflow_id) {
@@ -215,7 +311,10 @@ Deno.serve(async (req) => {
 
         if (node.type === "ai.summarize") {
           const input = resolveJsonPath(out, (config.input_path as string | undefined) ?? "$.input");
-          out[(config.output_key as string | undefined) ?? "summary"] = `Summary: ${String(typeof input === "string" ? input : JSON.stringify(input)).slice(0, 180)}`;
+          const summary = RUN_MODE === "live"
+            ? await summarizeTextLive(input, config)
+            : `Summary: ${String(typeof input === "string" ? input : JSON.stringify(input)).slice(0, 180)}`;
+          out[(config.output_key as string | undefined) ?? "summary"] = summary;
         }
         if (node.type === "ai.classify") {
           const input = resolveJsonPath(out, (config.input_path as string | undefined) ?? "$.input");

@@ -20,6 +20,8 @@ Vyntra — From Idea to Automation.
 5. Set function secrets:
    - `supabase secrets set OPENAI_API_KEY=... OPENAI_MODEL=gpt-4.1-mini`
    - optional: `supabase secrets set GENERATE_WORKFLOW_MONTHLY_LIMIT=250`
+   - optional: `supabase secrets set RUN_WORKFLOW_MONTHLY_LIMIT=500`
+   - optional: `supabase secrets set RUN_MODE=live`
    - optional: `supabase secrets set OPENAI_BASE_URL=...`
 6. Serve edge function locally:
    - `supabase functions serve generate-workflow --import-map supabase/functions/import_map.json`
@@ -27,6 +29,13 @@ Vyntra — From Idea to Automation.
    - `npm run dev`
 8. Run smoke tests:
    - `npm test`
+9. Run live integration smoke (requires a real test user account):
+   - env:
+     - `SUPABASE_URL=...`
+     - `SUPABASE_ANON_KEY=...`
+     - `SMOKE_TEST_EMAIL=...`
+     - `SMOKE_TEST_PASSWORD=...`
+   - command: `npm run smoke:live`
 
 ## Key Paths
 - Shared schema: `shared/schema/workflow.ts`

@@ -55,6 +55,7 @@ export function AppShell() {
             <NavLink to="/app" end className="text-slate-300 hover:text-white">Dashboard</NavLink>
             <NavLink to="/app/templates" className="text-slate-300 hover:text-white">Templates</NavLink>
             <NavLink to="/app/runs" className="text-slate-300 hover:text-white">Runs</NavLink>
+            <NavLink to="/app/system" className="text-slate-300 hover:text-white">System</NavLink>
             <NavLink to="/app/workflows/new" className="text-slate-300 hover:text-white">New Workflow</NavLink>
             <Button variant="ghost" onClick={() => setPaletteOpen(true)} className="text-xs text-slate-300">Cmd+K</Button>
             <Button variant="outline" onClick={onSignOut}>Sign out</Button>
@@ -72,6 +73,7 @@ export function AppShell() {
               <button className="w-full rounded bg-white/5 p-3 text-left text-sm hover:bg-white/10" onClick={() => runCommand("/app/workflows/new")}>Create new workflow</button>
               <button className="w-full rounded bg-white/5 p-3 text-left text-sm hover:bg-white/10" onClick={() => runCommand("/app/templates")}>Browse templates</button>
               <button className="w-full rounded bg-white/5 p-3 text-left text-sm hover:bg-white/10" onClick={() => runCommand("/app/runs")}>Open run history</button>
+              <button className="w-full rounded bg-white/5 p-3 text-left text-sm hover:bg-white/10" onClick={() => runCommand("/app/system")}>Open system health</button>
               <button className="w-full rounded bg-white/5 p-3 text-left text-sm hover:bg-white/10" onClick={() => runCommand("/app")}>Go to dashboard</button>
             </div>
           </div>

@@ -9,7 +9,8 @@
     "dev": "npm run dev -w apps/web",
     "build": "npm run build -w apps/web",
     "preview": "npm run preview -w apps/web",
-    "test": "npm run test -w apps/web"
+    "test": "npm run test -w apps/web",
+    "smoke:live": "npm run smoke:live -w apps/web"
   },
   "dependencies": {
     "supabase": "^2.76.11"

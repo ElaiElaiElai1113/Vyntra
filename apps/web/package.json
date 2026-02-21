@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "test": "node src/lib/smoke-tests.ts"
+    "test": "node src/lib/smoke-tests.ts",
+    "smoke:live": "node scripts/live-smoke.ts"
   },
   "dependencies": {
     "@radix-ui/react-slot": "^1.1.1",

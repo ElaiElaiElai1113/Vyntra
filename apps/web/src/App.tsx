@@ -11,6 +11,7 @@ const WorkflowNewPage = lazy(() => import("@/pages/WorkflowNewPage").then((m) =>
 const WorkflowDetailPage = lazy(() => import("@/pages/WorkflowDetailPage").then((m) => ({ default: m.WorkflowDetailPage })));
 const TemplatesPage = lazy(() => import("@/pages/TemplatesPage").then((m) => ({ default: m.TemplatesPage })));
 const RunsPage = lazy(() => import("@/pages/RunsPage").then((m) => ({ default: m.RunsPage })));
+const SystemHealthPage = lazy(() => import("@/pages/SystemHealthPage").then((m) => ({ default: m.SystemHealthPage })));
 
 function Protected({ session, children }: { session: Session | null; children: JSX.Element }) {
   if (!session) return <Navigate to="/auth" replace />;
@@ -55,6 +56,7 @@ export default function App() {
           <Route path="workflows/:id" element={<WorkflowDetailPage />} />
           <Route path="templates" element={<TemplatesPage />} />
           <Route path="runs" element={<RunsPage />} />
+          <Route path="system" element={<SystemHealthPage />} />
         </Route>
       </Routes>
     </Suspense>
