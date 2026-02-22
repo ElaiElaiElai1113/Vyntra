@@ -20,10 +20,23 @@ type StepResult = {
   error?: string;
 };
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-};
+const CORS_ALLOW_ORIGINS = (Deno.env.get("CORS_ALLOW_ORIGINS") ?? "")
+  .split(",")
+  .map((v) => v.trim())
+  .filter(Boolean);
+
+function corsHeadersForOrigin(origin: string | null) {
+  const allowedOrigin = origin && CORS_ALLOW_ORIGINS.length > 0
+    ? (CORS_ALLOW_ORIGINS.includes(origin) ? origin : null)
+    : origin ?? "*";
+
+  return {
+    "Access-Control-Allow-Origin": allowedOrigin ?? "null",
+    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    Vary: "Origin",
+  };
+}
 
 const RUN_MODE = (Deno.env.get("RUN_MODE") ?? "simulate").toLowerCase();
 const OPENAI_BASE_URL = Deno.env.get("OPENAI_BASE_URL") ?? "https://api.openai.com/v1";
@@ -114,7 +127,7 @@ function classifyText(input: unknown, labels: string[]): { label: string; confid
   return { label: scored[0]?.label ?? "general", confidence: scored[0]?.score === 2 ? 0.92 : 0.67 };
 }
 
-async function callOpenAIText(args: { prompt: string; system?: string }): Promise<string> {
+async function callOpenAIText(args: { prompt: string; system?: string; forceJsonObject?: boolean }): Promise<string> {
   if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not configured");
 
   const res = await fetch(`${OPENAI_BASE_URL}/chat/completions`, {
@@ -126,6 +139,7 @@ async function callOpenAIText(args: { prompt: string; system?: string }): Promis
     body: JSON.stringify({
       model: OPENAI_MODEL,
       temperature: 0.2,
+      ...(args.forceJsonObject ? { response_format: { type: "json_object" } } : {}),
       messages: [
         {
           role: "system",
@@ -153,6 +167,35 @@ async function callOpenAIText(args: { prompt: string; system?: string }): Promis
   return content.trim();
 }
 
+function parseJsonObjectFromText(content: string): Record<string, unknown> | null {
+  const trimmed = content.trim();
+  const candidates: string[] = [trimmed];
+
+  // Extract fenced code block content if present.
+  const fenceMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenceMatch?.[1]) candidates.push(fenceMatch[1].trim());
+
+  // Extract first JSON object region.
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    candidates.push(trimmed.slice(firstBrace, lastBrace + 1));
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Try next candidate.
+    }
+  }
+
+  return null;
+}
+
 async function summarizeTextLive(input: unknown, config: Record<string, unknown>): Promise<string> {
   const source = typeof input === "string" ? input : JSON.stringify(input);
   const style = typeof config.style === "string" ? config.style : "concise";
@@ -163,6 +206,147 @@ async function summarizeTextLive(input: unknown, config: Record<string, unknown>
   const prompt = [
     `Task: ${instructions}`,
     `Style: ${style}. ${bulletHint}`,
+    "Input:",
+    source,
+  ].join("\n\n");
+
+  return callOpenAIText({ prompt });
+}
+
+async function classifyTextLive(
+  input: unknown,
+  labels: string[],
+  config: Record<string, unknown>,
+): Promise<{ label: string; confidence: number }> {
+  if (labels.length === 0) return classifyText(input, labels);
+
+  const source = typeof input === "string" ? input : JSON.stringify(input);
+  const instructions = typeof config.instructions === "string"
+    ? config.instructions
+    : "Classify the input into one label.";
+  const labelsList = labels.map((l) => `- ${l}`).join("\n");
+
+  const prompt = [
+    `${instructions}`,
+    "Return JSON only in this shape:",
+    '{"label":"<one label from provided list>","confidence":0.0}',
+    "Allowed labels:",
+    labelsList,
+    "Input:",
+    source,
+  ].join("\n\n");
+
+  const content = await callOpenAIText({
+    prompt,
+    system: "Return strict JSON only.",
+    forceJsonObject: true,
+  });
+  const parsed = parseJsonObjectFromText(content);
+  if (!parsed) {
+    // Fail open to deterministic classifier instead of failing entire workflow run.
+    return classifyText(input, labels);
+  }
+
+  const label = typeof parsed.label === "string"
+    ? parsed.label.trim()
+    : "";
+  const confidenceRaw = parsed.confidence;
+  const confidence = typeof confidenceRaw === "number"
+    ? confidenceRaw
+    : Number(confidenceRaw);
+
+  if (!labels.includes(label)) {
+    return classifyText(input, labels);
+  }
+  if (!Number.isFinite(confidence)) {
+    return classifyText(input, labels);
+  }
+
+  return { label, confidence: Math.max(0, Math.min(1, confidence)) };
+}
+
+function defaultExtractedFields(fields: unknown[]): Record<string, unknown> {
+  return Object.fromEntries(fields.map((f: any) => {
+    const key = f?.key ?? "field";
+    if (f?.type === "number") return [key, 0];
+    if (f?.type === "boolean") return [key, false];
+    if (f?.type === "array") return [key, []];
+    return [key, ""];
+  }));
+}
+
+function coerceFieldValue(value: unknown, type: string | undefined): unknown {
+  switch (type) {
+    case "number": {
+      const n = typeof value === "number" ? value : Number(value);
+      return Number.isFinite(n) ? n : 0;
+    }
+    case "boolean":
+      return Boolean(value);
+    case "array":
+      return Array.isArray(value) ? value : (value == null ? [] : [value]);
+    case "string":
+    default:
+      return typeof value === "string" ? value : JSON.stringify(value ?? "");
+  }
+}
+
+async function extractFieldsLive(
+  input: unknown,
+  fields: unknown[],
+  config: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  if (fields.length === 0) return {};
+
+  const source = typeof input === "string" ? input : JSON.stringify(input);
+  const instructions = typeof config.instructions === "string"
+    ? config.instructions
+    : "Extract structured fields from the input.";
+
+  const fieldSpec = fields.map((f: any) => ({
+    key: String(f?.key ?? "field"),
+    type: String(f?.type ?? "string"),
+    required: Boolean(f?.required),
+  }));
+
+  const prompt = [
+    instructions,
+    "Return JSON only as an object with the requested keys.",
+    "Field spec:",
+    JSON.stringify(fieldSpec),
+    "Input:",
+    source,
+  ].join("\n\n");
+
+  const content = await callOpenAIText({
+    prompt,
+    system: "Return strict JSON object only.",
+    forceJsonObject: true,
+  });
+
+  const parsed = parseJsonObjectFromText(content);
+  if (!parsed) return defaultExtractedFields(fields);
+
+  const out: Record<string, unknown> = {};
+  for (const spec of fieldSpec) {
+    out[spec.key] = coerceFieldValue(parsed[spec.key], spec.type);
+  }
+  return out;
+}
+
+async function generateReportLive(input: unknown, config: Record<string, unknown>): Promise<string> {
+  const source = typeof input === "string" ? input : JSON.stringify(input);
+  const instructions = typeof config.instructions === "string"
+    ? config.instructions
+    : "Generate a concise report from the input.";
+  const template = typeof config.template === "string" ? config.template : "Report";
+  const format = typeof config.format === "string" ? config.format : "markdown";
+
+  const prompt = [
+    `Task: ${instructions}`,
+    `Template: ${template}`,
+    `Output format: ${format}`,
+    "Return only the report content.",
     "Input:",
     source,
   ].join("\n\n");
@@ -210,7 +394,15 @@ function topo(doc: any) {
 }
 
 Deno.serve(async (req) => {
+  const origin = req.headers.get("Origin");
+  const corsHeaders = corsHeadersForOrigin(origin);
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
+  if (origin && CORS_ALLOW_ORIGINS.length > 0 && !CORS_ALLOW_ORIGINS.includes(origin)) {
+    return new Response(JSON.stringify({ ok: false, error: "Origin not allowed" }), {
+      status: 403,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
   if (req.method !== "POST") return new Response(JSON.stringify({ ok: false, error: "Method not allowed" }), { status: 405, headers: { ...corsHeaders, "Content-Type": "application/json" } });
 
   try {
@@ -221,6 +413,13 @@ Deno.serve(async (req) => {
     }
 
     const authHeader = req.headers.get("Authorization") ?? "";
+    const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
+    if (!bearerMatch || !bearerMatch[1]?.trim()) {
+      return new Response(JSON.stringify({ ok: false, error: "Unauthorized" }), {
+        status: 401,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
     const client = createClient(supabaseUrl, supabaseAnon, {
       global: { headers: { Authorization: authHeader } },
     });
@@ -275,6 +474,12 @@ Deno.serve(async (req) => {
     if (wfErr || !wf) {
       return new Response(JSON.stringify({ ok: false, error: "Workflow not found" }), { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
+    if (wf.user_id !== user.id) {
+      return new Response(JSON.stringify({ ok: false, error: "Forbidden" }), {
+        status: 403,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
 
     const doc = wf.definition_json as any;
     if (!doc?.workflow?.nodes || !doc?.workflow?.edges) {
@@ -319,23 +524,36 @@ Deno.serve(async (req) => {
         if (node.type === "ai.classify") {
           const input = resolveJsonPath(out, (config.input_path as string | undefined) ?? "$.input");
           const labels = Array.isArray(config.labels) ? config.labels.filter((x): x is string => typeof x === "string") : [];
-          const result = classifyText(input, labels);
+          const result = RUN_MODE === "live"
+            ? await classifyTextLive(input, labels, config)
+            : classifyText(input, labels);
           out[(config.output_key as string | undefined) ?? "label"] = result.label;
           out[(config.confidence_key as string | undefined) ?? "confidence"] = result.confidence;
         }
         if (node.type === "ai.extract_fields") {
           const fields = Array.isArray(config.fields) ? config.fields : [];
-          const extracted = Object.fromEntries(fields.map((f: any) => [f?.key ?? "field", f?.type === "number" ? 0 : f?.type === "boolean" ? false : f?.type === "array" ? [] : ""]));
+          const input = resolveJsonPath(out, (config.input_path as string | undefined) ?? "$.input");
+          const extracted = RUN_MODE === "live"
+            ? await extractFieldsLive(input, fields, config)
+            : defaultExtractedFields(fields);
           out[(config.output_key as string | undefined) ?? "extracted"] = extracted;
         }
         if (node.type === "ai.generate_report") {
           const input = resolveJsonPath(out, (config.input_path as string | undefined) ?? "$.input");
-          out[(config.output_key as string | undefined) ?? "report"] = `# Generated Report\n\n- Source: ${JSON.stringify(input).slice(0, 120)}\n- Step 1\n- Step 2`;
+          out[(config.output_key as string | undefined) ?? "report"] = RUN_MODE === "live"
+            ? await generateReportLive(input, config)
+            : `# Generated Report\n\n- Source: ${JSON.stringify(input).slice(0, 120)}\n- Step 1\n- Step 2`;
         }
         if (node.type === "logic.delay") out.delay_applied = config.seconds ?? 0;
 
         if (node.type === "output.db_save") {
           const mapping = (config.mapping ?? {}) as Record<string, unknown>;
+          const tableName = typeof config.table === "string" && config.table.trim()
+            ? config.table.trim()
+            : "va_items";
+          if (tableName !== "va_items") {
+            throw new Error(`db_save unsupported table: ${tableName}`);
+          }
           const payload = Object.fromEntries(
             Object.entries(mapping).map(([key, value]) => {
               if (typeof value === "string" && value.startsWith("$")) return [key, resolveJsonPath(out, value)];
@@ -344,7 +562,7 @@ Deno.serve(async (req) => {
           );
 
           const { data: saved, error: saveErr } = await client
-            .from("va_items")
+            .from(tableName)
             .insert({
               user_id: user.id,
               workflow_id: wf.id,
@@ -357,7 +575,7 @@ Deno.serve(async (req) => {
 
           out.db_save = {
             would_save: true,
-            table: (config.table as string | undefined) ?? "va_items",
+            table: tableName,
             mode: (config.mode as string | undefined) ?? "insert",
             payload,
             inserted_id: saved?.id,

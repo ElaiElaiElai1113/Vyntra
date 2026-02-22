@@ -48,13 +48,13 @@ function decodeJwtPayload(token: string): Record<string, unknown> | null {
   }
 }
 
-function workflowDoc() {
+function successWorkflowDoc() {
   return {
     schema_version: "1.0",
     workflow: {
-      id: "wf_live_smoke",
-      name: "Live Smoke Workflow",
-      description: "Manual trigger -> summarize -> db save",
+      id: "wf_live_smoke_success",
+      name: "Live Smoke Workflow Success",
+      description: "Manual trigger -> summarize -> classify -> db save",
       tags: ["smoke", "live"],
       entry_node_id: "n1",
       variables: {},
@@ -92,9 +92,25 @@ function workflowDoc() {
         },
         {
           id: "n3",
+          type: "ai.classify",
+          name: "Classify Request",
+          position: { x: 560, y: 120 },
+          inputs: [{ id: "in", label: "In", schema: "JSON" }],
+          outputs: [{ id: "out", label: "Out", schema: "JSON" }],
+          config: {
+            input_path: "$.summary",
+            labels: ["lead", "operations", "admin", "other"],
+            output_key: "category",
+            confidence_key: "category_confidence",
+            instructions: "Classify into one of the provided labels.",
+          },
+          ui: { icon: "tag", color: "neutral" },
+        },
+        {
+          id: "n4",
           type: "output.db_save",
           name: "Save Result",
-          position: { x: 560, y: 120 },
+          position: { x: 800, y: 120 },
           inputs: [{ id: "in", label: "In", schema: "JSON" }],
           outputs: [{ id: "out", label: "Out", schema: "JSON" }],
           config: {
@@ -103,6 +119,8 @@ function workflowDoc() {
             mapping: {
               input: "$.input",
               summary: "$.summary",
+              category: "$.category",
+              category_confidence: "$.category_confidence",
             },
           },
           ui: { icon: "database", color: "neutral" },
@@ -123,9 +141,114 @@ function workflowDoc() {
           label: null,
           condition: null,
         },
+        {
+          id: "e3",
+          source: { node_id: "n3", port_id: "out" },
+          target: { node_id: "n4", port_id: "in" },
+          label: null,
+          condition: null,
+        },
       ],
     },
   };
+}
+
+function failureWorkflowDoc() {
+  return {
+    schema_version: "1.0",
+    workflow: {
+      id: "wf_live_smoke_failure",
+      name: "Live Smoke Workflow Failure",
+      description: "Intentional failure path for run status validation",
+      tags: ["smoke", "live", "failure"],
+      entry_node_id: "n1",
+      variables: {},
+      nodes: [
+        {
+          id: "n1",
+          type: "trigger.manual",
+          name: "Manual Trigger",
+          position: { x: 80, y: 120 },
+          inputs: [],
+          outputs: [{ id: "out", label: "Out", schema: "JSON" }],
+          config: { sample_input: { text: "force failure" } },
+          ui: { icon: "play", color: "neutral" },
+        },
+        {
+          id: "n2",
+          type: "output.db_save",
+          name: "Broken Save",
+          position: { x: 320, y: 120 },
+          inputs: [{ id: "in", label: "In", schema: "JSON" }],
+          outputs: [{ id: "out", label: "Out", schema: "JSON" }],
+          config: {
+            table: "definitely_missing_table",
+            mode: "insert",
+            mapping: { input: "$.input" },
+          },
+          ui: { icon: "database", color: "neutral" },
+        },
+      ],
+      edges: [
+        {
+          id: "e1",
+          source: { node_id: "n1", port_id: "out" },
+          target: { node_id: "n2", port_id: "in" },
+          label: null,
+          condition: null,
+        },
+      ],
+    },
+  };
+}
+
+async function createWorkflow(
+  authedClient: ReturnType<typeof createClient>,
+  userId: string,
+  args: { name: string; tags: string[]; definition_json: Record<string, unknown> },
+) {
+  const { data: workflow, error: wfErr } = await authedClient
+    .from("workflows")
+    .insert({
+      user_id: userId,
+      name: `${args.name} ${new Date().toISOString()}`,
+      description: "Automated smoke verification workflow",
+      prompt: "smoke test",
+      tags: args.tags,
+      definition_json: args.definition_json,
+    })
+    .select("id")
+    .single();
+  if (wfErr || !workflow?.id) {
+    throw new Error(`Workflow create failed: ${wfErr?.message ?? "unknown"}`);
+  }
+  return workflow.id as string;
+}
+
+async function invokeRun(workflowId: string, accessToken: string) {
+  const invokeRes = await fetch(`${SUPABASE_URL}/functions/v1/run-workflow`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({
+      workflow_id: workflowId,
+      input_json: {
+        text: "Client wants inbox cleanup, task triage, and weekly reporting.",
+        source: "live-smoke",
+      },
+    }),
+  });
+  const invokeText = await invokeRes.text();
+  let invokeData: Record<string, unknown> = {};
+  try {
+    invokeData = invokeText ? (JSON.parse(invokeText) as Record<string, unknown>) : {};
+  } catch {
+    invokeData = { error: invokeText || `Function failed (${invokeRes.status})` };
+  }
+  return { invokeRes, invokeData };
 }
 
 async function run() {
@@ -151,22 +274,11 @@ async function run() {
     },
   });
 
-  const { data: workflow, error: wfErr } = await authedClient
-    .from("workflows")
-    .insert({
-      user_id: userId,
-      name: `Live Smoke ${new Date().toISOString()}`,
-      description: "Automated smoke verification workflow",
-      prompt: "smoke test",
-      tags: ["smoke", "live"],
-      definition_json: workflowDoc(),
-    })
-    .select("id")
-    .single();
-
-  if (wfErr || !workflow?.id) {
-    throw new Error(`Workflow create failed: ${wfErr?.message ?? "unknown"}`);
-  }
+  const successWorkflowId = await createWorkflow(authedClient, userId, {
+    name: "Live Smoke Success",
+    tags: ["smoke", "live", "success"],
+    definition_json: successWorkflowDoc(),
+  });
 
   const userRes = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
     headers: {
@@ -180,28 +292,7 @@ async function run() {
   }
   console.log("Auth preflight passed.");
 
-  const invokeRes = await fetch(`${SUPABASE_URL}/functions/v1/run-workflow`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      apikey: SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${accessToken}`,
-    },
-    body: JSON.stringify({
-      workflow_id: workflow.id,
-      input_json: {
-        text: "Client wants inbox cleanup, task triage, and weekly reporting.",
-        source: "live-smoke",
-      },
-    }),
-  });
-  const invokeText = await invokeRes.text();
-  let invokeData: Record<string, unknown> = {};
-  try {
-    invokeData = invokeText ? (JSON.parse(invokeText) as Record<string, unknown>) : {};
-  } catch {
-    invokeData = { error: invokeText || `Function failed (${invokeRes.status})` };
-  }
+  const { invokeRes, invokeData } = await invokeRun(successWorkflowId, accessToken);
   if (!invokeRes.ok) {
     throw new Error(
       `Function invoke failed: status=${invokeRes.status} body=${JSON.stringify(invokeData)}`,
@@ -227,7 +318,7 @@ async function run() {
   const { data: vaItems, error: itemsErr } = await authedClient
     .from("va_items")
     .select("id,workflow_id,source_node_id,created_at,data_json")
-    .eq("workflow_id", workflow.id)
+    .eq("workflow_id", successWorkflowId)
     .gte("created_at", startedAtIso)
     .order("created_at", { ascending: false })
     .limit(1);
@@ -240,14 +331,53 @@ async function run() {
 
   const latest = vaItems[0] as { data_json?: Json; source_node_id?: string | null };
   const summary = latest.data_json?.summary;
-  if (latest.source_node_id !== "n3") {
+  const category = latest.data_json?.category;
+  const categoryConfidence = latest.data_json?.category_confidence;
+  if (latest.source_node_id !== "n4") {
     throw new Error(`Unexpected source_node_id: ${String(latest.source_node_id)}`);
   }
   if (typeof summary !== "string" || summary.trim().length < 5) {
     throw new Error("Expected non-empty summary in va_items.data_json.summary.");
   }
+  if (typeof category !== "string" || category.trim().length < 2) {
+    throw new Error("Expected non-empty category in va_items.data_json.category.");
+  }
+  if (typeof categoryConfidence !== "number" || categoryConfidence < 0 || categoryConfidence > 1) {
+    throw new Error("Expected category_confidence to be a number between 0 and 1.");
+  }
 
-  console.log(`Smoke live run passed. workflow_id=${workflow.id} run_id=${runId}`);
+  const failureWorkflowId = await createWorkflow(authedClient, userId, {
+    name: "Live Smoke Failure",
+    tags: ["smoke", "live", "failure"],
+    definition_json: failureWorkflowDoc(),
+  });
+  const { invokeRes: failRes, invokeData: failData } = await invokeRun(failureWorkflowId, accessToken);
+  if (failRes.status !== 500) {
+    throw new Error(
+      `Expected failure run HTTP 500, got ${failRes.status}. ` +
+      `Response=${JSON.stringify(failData)}. ` +
+      "If this is 200, your hosted run-workflow is likely running an older deployment.",
+    );
+  }
+  const failedRunId = typeof failData.run_id === "string" ? failData.run_id : "";
+  if (!failedRunId) {
+    throw new Error(`Expected failed run id in response, got ${JSON.stringify(failData)}`);
+  }
+  const { data: failedRun, error: failedRunErr } = await authedClient
+    .from("runs")
+    .select("id,status")
+    .eq("id", failedRunId)
+    .single();
+  if (failedRunErr || !failedRun) {
+    throw new Error(`Failed run fetch failed: ${failedRunErr?.message ?? "not found"}`);
+  }
+  if (failedRun.status !== "failed") {
+    throw new Error(`Expected failed run status, got ${failedRun.status}`);
+  }
+
+  console.log(
+    `Smoke live run passed. success_workflow_id=${successWorkflowId} success_run_id=${runId} failed_workflow_id=${failureWorkflowId} failed_run_id=${failedRunId}`,
+  );
 }
 
 run().catch((err) => {
